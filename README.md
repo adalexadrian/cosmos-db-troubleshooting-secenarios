@@ -20,6 +20,7 @@ pip install "azure-cosmos>=4.7" azure-identity
 | `COSMOS_KEY` | Yes* | Primary key (*or set `COSMOS_USE_AAD=1` to use Entra ID) |
 | `COSMOS_THROUGHPUT` | No | RU/s for the main container (default `40000`) |
 | `COSMOS_DB` / `COSMOS_CONTAINER` | No | Names (default `perf-demo-db` / `orders`) |
+| `COSMOS_POOL_SIZE` | No | HTTP connection pool size (default `100`); keep it >= number of threads |
 | `COSMOS_PREFERRED_LOCATIONS` | No | Comma-separated regions, e.g. `West Europe,North Europe` |
 
 **PowerShell**
@@ -53,7 +54,7 @@ Or run everything in order: `python cosmos_demo.py all`
 |---|---|
 | `setup` | Creates the database and container (add `--autoscale` for autoscale up to 40,000 RU/s) |
 | `load` | Multi-threaded bulk insert (`--docs`, `--workers`, `--customers`) |
-| `perf` | Runs the 3 performance scenarios |
+| `perf` | Runs the 3 performance scenarios (`--throttle-seconds`, default 120) |
 | `connectivity` | Runs the 2 connectivity scenarios |
 | `best-practices` | Runs the 3 best-practice scenarios |
 | `failover-watch` | Live routing monitor for manual failover tests (`--watch-seconds`) |
@@ -67,7 +68,7 @@ Or run everything in order: `python cosmos_demo.py all`
 | # | Scenario | What it demonstrates | What to look for |
 |---|---|---|---|
 | P1 | **High latency** | Compares a point read, a single-partition query, a cross-partition query, and a full scan on an unindexed field | RU and latency rise at each step; prints query metrics and activity id |
-| P2 | **Throughput optimization** | Blasts writes at a 400 RU/s container with SDK retries off, then scales to 4,000 RU/s and repeats | High 429 rate before scaling, low after; playbook for autoscale and hot partitions |
+| P2 | **Throughput optimization** | Sustained write load for 2 minutes (change with `--throttle-seconds`) on a 400 RU/s container with SDK retries off, then scales to 4,000 RU/s for 30 s | Live progress line every 10 s; high 429 rate before scaling, low after; playbook for autoscale and hot partitions |
 | P3 | **Indexing problems** | Default vs tuned indexing policy: write cost, unindexed filter, multi-field `ORDER BY` | Tuned policy writes cheaper; `ORDER BY` fails (400) without a composite index |
 
 ### 2. Connectivity and configuration (`connectivity`, `failover-watch`)
