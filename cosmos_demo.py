@@ -25,6 +25,9 @@ import argparse, base64, json, logging, os, random, sys, threading, time, uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+import requests
+from requests.adapters import HTTPAdapter
+from azure.core.pipeline.transport import RequestsTransport
 from azure.cosmos import CosmosClient, PartitionKey, ThroughputProperties, documents, exceptions
 from azure.core.exceptions import ServiceRequestError, ServiceResponseError
 
@@ -65,6 +68,19 @@ def credential():
     return KEY
 
 
+POOL_SIZE = int(os.getenv("COSMOS_POOL_SIZE", "100"))
+
+
+def make_transport(pool_size=POOL_SIZE):
+    """HTTP transport with a bigger connection pool (default is 10 -> 'Connection pool is full'
+    warnings as soon as more than 10 threads share one client)."""
+    session = requests.Session()
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return RequestsTransport(session=session)
+
+
 def make_client(*, endpoint=None, cred=None, max_429_retries=9, max_429_wait=30,
                 preferred_locations=None, **kwargs):
     """Single place where every client is built. Reuse ONE client per process (singleton)."""
@@ -74,7 +90,8 @@ def make_client(*, endpoint=None, cred=None, max_429_retries=9, max_429_wait=30,
     policy.RetryOptions = documents.RetryOptions(
         max_retry_attempt_count=max_429_retries,        # SDK-side retry on HTTP 429
         max_wait_time_in_seconds=max_429_wait)
-    opts = dict(connection_policy=policy, user_agent="cosmos-troubleshooting-demo")
+    opts = dict(connection_policy=policy, user_agent="cosmos-troubleshooting-demo",
+                transport=make_transport())
     if preferred_locations:
         opts["preferred_locations"] = preferred_locations
     opts.update(kwargs)
@@ -326,8 +343,8 @@ def scenario_latency(container):
      => the problem is network/client, not Cosmos DB.""")
 
 
-def scenario_throttling(db):
-    banner("PERFORMANCE 2 - Throughput optimisation: 429s, scaling, hot partitions")
+def scenario_throttling(db, seconds=120):
+    banner(f"PERFORMANCE 2 - Throughput optimisation: sustained 429s for {seconds}s, then scale-up")
     name = "throttle-demo"
     cont = db.create_container_if_not_exists(id=name, partition_key=PartitionKey(path="/pk"),
                                              offer_throughput=400)
@@ -335,8 +352,8 @@ def scenario_throttling(db):
     raw = make_client(max_429_retries=0)
     tcont = raw.get_database_client(DB_NAME).get_container_client(name)
 
-    def blast(label, seconds=8, threads=24):
-        m, stop = Metrics(), time.time() + seconds
+    def blast(label, duration, threads=24):
+        m, stop = Metrics(), time.time() + duration
 
         def w():
             while time.time() < stop:
@@ -346,20 +363,41 @@ def scenario_throttling(db):
                                        "data": "y" * 800}, response_hook=lambda h, _b: box.update(h))
                     m.add((time.perf_counter() - t) * 1000, _ru(box))
                 except exceptions.CosmosHttpResponseError as e:
-                    m.add(status=e.status_code)
+                    m.add(status=e.status_code or 500)
+                    if e.status_code == 429:
+                        time.sleep(0.02)          # avoid burning client CPU in a tight 429 loop
+
+        print(f"\n  {label} - {duration}s, {threads} threads")
+        start = last_t = time.time()
+        last = (0, 0, 0.0)
         with ThreadPoolExecutor(threads) as ex:
             for _ in range(threads):
                 ex.submit(w)
+            while time.time() < stop:                     # progress line every 10 s
+                time.sleep(max(0.0, min(10, stop - time.time())))
+                now = time.time()
+                ok, thr, ru = m.ok, m.throttled, m.ru
+                d_ok, d_thr, d_ru = ok - last[0], thr - last[1], ru - last[2]
+                dt = max(now - last_t, 1e-6)
+                pct = 100 * d_thr / max(d_ok + d_thr, 1)
+                print(f"    t+{now - start:4.0f}s  ok={d_ok:6,}  429={d_thr:7,} ({pct:3.0f}% throttled)"
+                      f"  ~{d_ru / dt:6,.0f} RU/s consumed")
+                last, last_t = (ok, thr, ru), now
         total = m.ok + m.throttled
-        print(f"  {label}: {total:,} requests, {m.throttled:,} throttled "
-              f"({100 * m.throttled / max(total, 1):.0f}% 429), ~{m.ru / seconds:,.0f} RU/s consumed")
+        print(f"  => {label}: {total:,} requests, {m.throttled:,} throttled "
+              f"({100 * m.throttled / max(total, 1):.0f}% 429), "
+              f"avg ~{m.ru / duration:,.0f} RU/s consumed")
 
     try:
-        blast("A) 400 RU/s, SDK retries OFF")
-        cont.replace_throughput(4000)
-        print("  -> scaled container to 4,000 RU/s (replace_throughput)")
-        time.sleep(3)
-        blast("B) 4,000 RU/s, SDK retries OFF")
+        blast("A) 400 RU/s, SDK retries OFF", seconds)
+        try:
+            cont.replace_throughput(4000)
+            print("\n  -> scaled container to 4,000 RU/s (replace_throughput), waiting 5 s ...")
+            time.sleep(5)
+            blast("B) 4,000 RU/s, SDK retries OFF", min(30, seconds))
+        except exceptions.CosmosHttpResponseError as e:
+            print("\n  Could not scale to 4,000 RU/s (account throughput limit?) - skipping phase B")
+            explain(e)
     finally:
         db.delete_container(name)
 
@@ -373,7 +411,8 @@ def scenario_throttling(db):
      others idle = hot partition -> change pk / add synthetic pk, don't just add RU.
    * Lower RU per operation: projections, smaller docs, fewer indexed paths, point reads.
    * Each physical partition is capped at 10,000 RU/s and 50 GB - 40k RU/s only helps if load
-     is spread over >= 4 logical-key ranges.""")
+     is spread over >= 4 logical-key ranges.
+   * Many threads on one client? Size the HTTP pool (COSMOS_POOL_SIZE) >= thread count.""")
 
 
 def scenario_indexing(db):
@@ -685,6 +724,8 @@ def main():
     ap.add_argument("--customers", type=int, default=5000, help="distinct partition key values")
     ap.add_argument("--autoscale", action="store_true", help="autoscale max 40k instead of manual 40k")
     ap.add_argument("--watch-seconds", type=int, default=60)
+    ap.add_argument("--throttle-seconds", type=int, default=120,
+                    help="how long the sustained-429 phase of `perf` runs (default 120)")
     a = ap.parse_args()
 
     if a.command == "connectivity":                 # scenario 1 builds its own clients
@@ -705,7 +746,7 @@ def main():
         bulk_load(container, a.docs, a.workers, a.customers)
     if a.command in ("perf", "all"):
         scenario_latency(container)
-        scenario_throttling(db)
+        scenario_throttling(db, a.throttle_seconds)
         scenario_indexing(db)
     if a.command in ("connectivity", "all"):
         if a.command == "all":
